@@ -1,5 +1,6 @@
 #include <iostream>
 #include <thread>
+#include <chrono>
 #include <string>
 #include <vector>
 #include <atomic>
@@ -97,21 +98,42 @@ public:
 
     ~CameraWrapper() {
         if (cam) {
+            // Stop the live stream before closing. Closing while still streaming
+            // leaves the camera in a streaming state, and the next session then
+            // hangs on "timeout to wait for synchronize" during Open().
+            cam->StopLiveStreaming();
             cam->Close();
         }
     }
 
     int run_camera() {
         ins_camera::DeviceDiscovery discovery;
-        auto list = discovery.GetAvailableDevices();
-        if (list.empty()) {
-            RCLCPP_ERROR(node_->get_logger(), "No available camera devices found.");
+
+        // Wait until a camera is enumerated instead of failing immediately. This
+        // lets the node be launched before the camera is plugged in / switched to
+        // USB mode, and avoids an instant "no camera found" on reconnection.
+        std::vector<ins_camera::DeviceDescriptor> list;
+        while (rclcpp::ok()) {
+            list = discovery.GetAvailableDevices();
+            if (!list.empty()) {
+                break;
+            }
+            RCLCPP_WARN_THROTTLE(
+                node_->get_logger(), *node_->get_clock(), 5000,
+                "No camera found. Waiting for device (plug in the camera / switch it to USB mode)...");
+            std::this_thread::sleep_for(std::chrono::seconds(1));
+        }
+        if (!rclcpp::ok()) {
             return -1;
         }
 
         cam = std::make_shared<ins_camera::Camera>(list[0].info);
-        if (!cam->Open()) {
-            RCLCPP_ERROR(node_->get_logger(), "Failed to open camera.");
+        while (rclcpp::ok() && !cam->Open()) {
+            RCLCPP_WARN(node_->get_logger(), "Failed to open camera. Retrying...");
+            std::this_thread::sleep_for(std::chrono::seconds(1));
+        }
+        if (!rclcpp::ok()) {
+            discovery.FreeDeviceDescriptors(list);
             return -1;
         }
         RCLCPP_INFO(node_->get_logger(), "Camera opened successfully.");
@@ -138,11 +160,14 @@ public:
         param.enable_audio = false;
         param.using_lrv = false;
 
-        if (!cam->StartLiveStreaming(param)) {
-            RCLCPP_ERROR(node_->get_logger(), "Failed to start live streaming.");
+        while (rclcpp::ok() && !cam->StartLiveStreaming(param)) {
+            RCLCPP_WARN(node_->get_logger(), "Failed to start live streaming. Retrying...");
+            std::this_thread::sleep_for(std::chrono::seconds(1));
+        }
+        if (!rclcpp::ok()) {
             return -1;
         }
-        
+
         RCLCPP_INFO(node_->get_logger(), "Live streaming started.");
         return 0;
     }
